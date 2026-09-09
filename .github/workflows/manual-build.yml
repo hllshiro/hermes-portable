@@ -16,6 +16,11 @@ on:
 permissions:
   contents: write
 
+# Serialize repeated manual builds of the same upstream tag.
+concurrency:
+  group: manual-build-${{ github.event.inputs.upstream_tag || 'latest' }}
+  cancel-in-progress: false
+
 jobs:
   resolve:
     name: Resolve version

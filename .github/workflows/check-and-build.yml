@@ -9,6 +9,13 @@ on:
 permissions:
   contents: write
 
+# Serialize scheduled runs so an upstream release detected while a build is
+# still running (or two near-coincident cron ticks reading a stale
+# .last-built-version) cannot trigger two builds of the same tag.
+concurrency:
+  group: check-and-build
+  cancel-in-progress: false
+
 jobs:
   check:
     name: Check for new release

@@ -5,7 +5,7 @@
 ## 工作原理
 
 1. **每 2 小时**自动检查上游 release
-2. 发现新版本后自动构建 Windows / Linux 离线便携包（内含 Python、Node.js、Git、uv、ripgrep、ffmpeg、全部依赖 wheel、Playwright Chromium）
+2. 发现新版本后自动构建 Windows / Linux 离线便携包（内含 Python、Node.js、Git、uv、ripgrep、ffmpeg、全部依赖的 uv 离线缓存、Playwright Chromium）
 3. 构建产物自动发布到 [Releases](https://github.com/hllshiro/hermes-portable/releases)
 4. 也支持手动触发，指定任意上游 tag
 
@@ -72,7 +72,7 @@ model:
 
 ## 便携版特点
 
-- **完全离线安装**：首次 `setup-offline` 从包内 wheel 缓存重建环境，保留上游 uv.lock 的 SHA256 哈希校验
+- **完全离线安装**：首次 `setup-offline` 从包内 uv 缓存以 `uv sync --locked --offline` 重建环境，依赖版本严格锁定于上游 uv.lock
 - 无需安装 Python / Node.js / Git / uv / ripgrep / ffmpeg
 - 内含 Playwright Chromium（浏览器工具离线可用）
 - `HERMES_HOME` 默认指向包内 `data/`，解压即用、可整目录迁移（迁移后重跑一次 `setup-offline`）
