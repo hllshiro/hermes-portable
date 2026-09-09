@@ -62,16 +62,16 @@ hermes-portable/
 ├── data/                 # 默认 HERMES_HOME（配置、会话、记忆；不入包，首建）
 ├── wheels/               # uv.lock 导出的 --extra all 全部 wheel（带哈希）
 ├── browsers/             # Playwright Chromium（ms-playwright 缓存目录原样）
-├── offline-uv.toml       # find-links 指向 wheels/，强制离线解析
+├── offline-uv.toml       # offline=true；wheel 目录由 UV_FIND_LINKS 环境变量指绝对路径（避免配置文件相对路径歧义）
 ├── VERSION               # 上游 tag + 构建时间 + 构建来源
 └── README-PORTABLE.txt   # 快速上手（离线场景）
 ```
 
 ### 首次安装流程（setup-offline）
 
-1. 设环境变量：`UV_OFFLINE=1`、`UV_NO_CONFIG=1`、`UV_PYTHON=<runtime/python>`、
-   `UV_CONFIG_FILE=<offline-uv.toml>`、`VIRTUAL_ENV=<app/venv>`、
-   `PLAYWRIGHT_BROWSERS_PATH=<browsers/>`
+1. 设环境变量：`UV_OFFLINE=1`、`UV_PYTHON=<runtime/python>`、
+   `UV_FIND_LINKS=<wheels/ 绝对路径>`、`UV_CONFIG_FILE=<offline-uv.toml>`、
+   `UV_PROJECT_ENVIRONMENT=<app/venv>`、`PLAYWRIGHT_BROWSERS_PATH=<browsers/>`
 2. `uv sync --extra all --locked --offline`
    —— 保留上游 uv.lock 的 SHA256 哈希校验（供应链防线不降级），wheel 全部来自包内 `wheels/`
 3. 写 `hermes` 启动 shim；创建 `data/`；从 `.env.example` 生成 `.env`（若不存在）
