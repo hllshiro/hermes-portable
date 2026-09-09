@@ -1,0 +1,5 @@
+# 构建产物（本地试验时生成）
+hermes-portable/
+*.zip
+*.tar.gz
+node_modules/
