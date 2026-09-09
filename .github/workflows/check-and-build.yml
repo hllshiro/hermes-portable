@@ -1,0 +1,70 @@
+name: Check upstream release
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'  # Every 2 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: Check for new release
+    runs-on: ubuntu-latest
+    outputs:
+      has_new: ${{ steps.check.outputs.has_new }}
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check upstream release
+        id: check
+        run: |
+          LAST_BUILT=$(cat .last-built-version 2>/dev/null || echo "")
+          echo "Last built: ${LAST_BUILT:-none}"
+
+          LATEST_TAG=$(curl -s https://api.github.com/repos/NousResearch/hermes-agent/releases/latest \
+            | grep '"tag_name"' | head -1 | sed 's/.*: "//;s/".*//')
+          echo "Upstream latest: $LATEST_TAG"
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "Failed to fetch upstream release"
+            echo "has_new=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$LATEST_TAG" = "$LAST_BUILT" ]; then
+            echo "Already built, skipping."
+            echo "has_new=false" >> $GITHUB_OUTPUT
+          else
+            echo "New version detected!"
+            echo "has_new=true" >> $GITHUB_OUTPUT
+          fi
+
+          VERSION="${LATEST_TAG#v}"
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Result: $LATEST_TAG (version: $VERSION)"
+
+      - name: Update version record
+        if: steps.check.outputs.has_new == 'true'
+        run: |
+          echo "${{ steps.check.outputs.tag }}" > .last-built-version
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .last-built-version
+          git commit -m "build: ${{ steps.check.outputs.tag }}" || echo "No changes"
+          git push
+
+  build:
+    name: Build portable packages
+    needs: check
+    if: needs.check.outputs.has_new == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      tag: ${{ needs.check.outputs.tag }}
+      version: ${{ needs.check.outputs.version }}
+    secrets: inherit

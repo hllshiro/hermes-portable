@@ -1,0 +1,57 @@
+name: Manual Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream tag (e.g. v2026.9.7). Leave empty to use latest release.'
+        required: false
+        default: ''
+      node_version:
+        description: 'Node.js major version'
+        required: false
+        default: '22'
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve target tag and generate version
+        id: resolve
+        run: |
+          TAG="${{ github.event.inputs.upstream_tag }}"
+
+          if [ -z "$TAG" ]; then
+            TAG=$(curl -s https://api.github.com/repos/NousResearch/hermes-agent/releases/latest \
+              | grep '"tag_name"' | head -1 | sed 's/.*: "//;s/".*//')
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "ERROR: Could not resolve tag"
+            exit 1
+          fi
+
+          TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
+          TAG_VERSION="${TAG#v}"
+          VERSION="${TAG_VERSION}-build.${TIMESTAMP}"
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building: $TAG (version: $VERSION)"
+
+  build:
+    name: Build portable packages
+    needs: resolve
+    uses: ./.github/workflows/build.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      version: ${{ needs.resolve.outputs.version }}
+      node_version: ${{ github.event.inputs.node_version }}
+    secrets: inherit
