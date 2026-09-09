@@ -1,3 +1,4 @@
+# hermes-portable — offline portable build for NousResearch/hermes-agent
 name: Check upstream release
 
 on:
