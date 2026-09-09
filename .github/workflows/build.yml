@@ -1,0 +1,498 @@
+name: Build Portable Packages
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      node_version:
+        required: false
+        type: string
+        default: '22'
+      python_version:
+        required: false
+        type: string
+        default: '3.11'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ inputs.tag }}
+          path: source
+          fetch-depth: 1
+
+      - name: Setup uv (with Python ${{ inputs.python_version }})
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Create portable skeleton
+        shell: bash
+        run: |
+          mkdir -p hermes-portable/runtime/{python,node,git,uv,tools}
+          mkdir -p hermes-portable/{wheels,browsers,scripts,data}
+          cp -r source hermes-portable/app
+          echo "Skeleton ready:"; ls hermes-portable
+
+      - name: Bundle Python runtime
+        shell: bash
+        run: |
+          uv python install ${{ inputs.python_version }}
+          PYDIR=$(uv python dir)
+          SRC=$(ls -d "$PYDIR"/cpython-${{ inputs.python_version }}*windows*x86_64* | head -1)
+          echo "Copying Python from: $SRC"
+          cp -r "$SRC"/* hermes-portable/runtime/python/
+          hermes-portable/runtime/python/python.exe --version
+
+      - name: Bundle Node.js runtime
+        shell: bash
+        run: |
+          NODE_VER=$(node -v | sed 's/v//')
+          echo "Downloading Node.js v$NODE_VER..."
+          curl -sL -o node.zip "https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-win-x64.zip"
+          unzip -q node.zip -d node-tmp
+          mv node-tmp/node-v${NODE_VER}-win-x64/* hermes-portable/runtime/node/
+          rm -rf node.zip node-tmp
+          hermes-portable/runtime/node/node.exe --version
+
+      - name: Bundle MinGit
+        shell: bash
+        run: |
+          ASSET=$(curl -s https://api.github.com/repos/git-for-windows/git/releases/latest \
+            | grep browser_download_url | grep -i mingit | grep 64-bit | grep -v busybox | head -1 | sed 's/.*: "//;s/".*//')
+          echo "MinGit asset: $ASSET"
+          [ -n "$ASSET" ] || { echo "ERROR: MinGit asset not found"; exit 1; }
+          curl -sL -o mingit.zip "$ASSET"
+          unzip -q mingit.zip -d hermes-portable/runtime/git
+          rm mingit.zip
+          hermes-portable/runtime/git/cmd/git.exe --version
+
+      - name: Bundle uv, ripgrep, ffmpeg
+        shell: bash
+        run: |
+          cp "$(which uv)" hermes-portable/runtime/uv/uv.exe
+          RG_URL=$(curl -s https://api.github.com/repos/BurntSushi/ripgrep/releases/latest \
+            | grep browser_download_url | grep x86_64-pc-windows-msvc.zip | head -1 | sed 's/.*: "//;s/".*//')
+          echo "ripgrep asset: $RG_URL"
+          [ -n "$RG_URL" ] || { echo "ERROR: ripgrep asset not found"; exit 1; }
+          curl -sL -o rg.zip "$RG_URL"
+          unzip -q rg.zip -d rg-tmp
+          find rg-tmp -name rg.exe -exec cp {} hermes-portable/runtime/tools/ \;
+          rm -rf rg.zip rg-tmp
+          curl -sL -o ffmpeg.zip "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          unzip -q ffmpeg.zip -d ff-tmp
+          find ff-tmp -name ffmpeg.exe -exec cp {} hermes-portable/runtime/tools/ \;
+          find ff-tmp -name ffprobe.exe -exec cp {} hermes-portable/runtime/tools/ \;
+          rm -rf ffmpeg.zip ff-tmp
+          hermes-portable/runtime/uv/uv.exe --version
+          hermes-portable/runtime/tools/rg.exe --version | head -1
+          hermes-portable/runtime/tools/ffmpeg.exe -version | head -1
+
+      - name: Export locked requirements and download wheels
+        shell: bash
+        working-directory: source
+        run: |
+          uv export --extra all --locked --no-emit-project --no-annotate -o ../requirements-export.txt
+          python -m pip download -r ../requirements-export.txt -d ../hermes-portable/wheels
+          # Root project PEP 517 build backend (needed to build hermes-agent itself offline)
+          python -m pip download "setuptools==83.0.0" wheel -d ../hermes-portable/wheels
+          echo "Wheel count: $(ls ../hermes-portable/wheels | wc -l)"
+
+      - name: Install Node dependencies into app
+        shell: bash
+        working-directory: hermes-portable/app
+        run: |
+          npm install --workspace ui-tui --workspace web --silent || {
+            echo "::warning::scoped npm install failed, falling back to root install"
+            npm install --silent
+          }
+
+      - name: Bundle Playwright Chromium
+        shell: bash
+        working-directory: hermes-portable/app
+        run: |
+          npx playwright install chromium || echo "::warning::playwright chromium download failed; browser tool will need a system browser"
+          if [ -d "$LOCALAPPDATA/ms-playwright" ]; then
+            cp -r "$LOCALAPPDATA/ms-playwright"/* ../browsers/
+            echo "Bundled browsers:"; ls ../browsers
+          fi
+
+      - name: Generate launcher scripts (Windows)
+        shell: pwsh
+        run: |
+          @"
+          @echo off
+          setlocal
+          set "ROOT=%~dp0"
+          if not exist "%ROOT%app\venv\Scripts\hermes.exe" (
+            echo [Hermes] Offline install not found. Run setup-offline.bat first.
+            exit /b 1
+          )
+          set "PATH=%ROOT%runtime\python;%ROOT%runtime\node;%ROOT%runtime\git\cmd;%ROOT%runtime\uv;%ROOT%runtime\tools;%PATH%"
+          set "PLAYWRIGHT_BROWSERS_PATH=%ROOT%browsers"
+          if not defined HERMES_HOME set "HERMES_HOME=%ROOT%data"
+          "%ROOT%app\venv\Scripts\hermes.exe" %*
+          "@ | Out-File "hermes-portable\hermes.bat" -Encoding ASCII
+
+          @"
+          @echo off
+          setlocal
+          set "ROOT=%~dp0"
+          echo [Hermes] Offline install starting (1-3 min)...
+          set "PATH=%ROOT%runtime\uv;%ROOT%runtime\python;%ROOT%runtime\node;%ROOT%runtime\git\cmd;%ROOT%runtime\tools;%PATH%"
+          set "UV_OFFLINE=1"
+          set "UV_PYTHON=%ROOT%runtime\python\python.exe"
+          set "UV_FIND_LINKS=%ROOT%wheels"
+          set "UV_CONFIG_FILE=%ROOT%offline-uv.toml"
+          set "UV_PROJECT_ENVIRONMENT=%ROOT%app\venv"
+          set "PLAYWRIGHT_BROWSERS_PATH=%ROOT%browsers"
+          cd /d "%ROOT%app"
+          uv sync --extra all --locked --offline
+          if errorlevel 1 (
+            echo [Hermes] Offline install FAILED. See output above.
+            exit /b 1
+          )
+          if not exist "%ROOT%data" mkdir "%ROOT%data"
+          if not exist "%ROOT%app\.env" if exist "%ROOT%app\.env.example" copy "%ROOT%app\.env.example" "%ROOT%app\.env" >nul
+          echo [Hermes] Verifying...
+          "%ROOT%app\venv\Scripts\hermes.exe" --version
+          if errorlevel 1 (
+            echo [Hermes] Verification FAILED.
+            exit /b 1
+          )
+          echo [Hermes] Offline install complete. Run hermes.bat to start.
+          "@ | Out-File "hermes-portable\setup-offline.bat" -Encoding ASCII
+
+          @"
+          @echo off
+          set "SCRIPT_DIR=%~dp0"
+          call "%SCRIPT_DIR%..\hermes.bat" gateway %*
+          "@ | Out-File "hermes-portable\scripts\gateway.bat" -Encoding ASCII
+
+      - name: Write offline config, VERSION, portable README
+        shell: bash
+        run: |
+          cat > hermes-portable/offline-uv.toml << 'EOF'
+          # hermes-portable: force fully-offline resolution.
+          # Wheels come from the bundled wheels/ directory (UV_FIND_LINKS,
+          # absolute path set by setup-offline / launcher scripts).
+          offline = true
+          EOF
+          cat > hermes-portable/VERSION << EOF
+          upstream_tag=${{ inputs.tag }}
+          version=${{ inputs.version }}
+          built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          built_by=hermes-portable CI (https://github.com/hllshiro/hermes-portable)
+          EOF
+          cat > hermes-portable/README-PORTABLE.txt << 'EOF'
+          Hermes Agent Portable (offline build)
+          =====================================
+          Windows: run setup-offline.bat first (once), then hermes.bat.
+          Gateway: scripts\gateway.bat
+          Model config for offline networks: hermes.bat model -> Custom endpoint
+          Data/config lives in .\data\ (HERMES_HOME).
+          See the repository README for details:
+          https://github.com/hllshiro/hermes-portable
+          EOF
+
+      - name: Smoke test offline install (empty uv cache)
+        shell: pwsh
+        run: |
+          $env:UV_CACHE_DIR = Join-Path $env:RUNNER_TEMP "uv-cache-smoke"
+          New-Item -ItemType Directory -Force -Path $env:UV_CACHE_DIR | Out-Null
+          cmd /c "hermes-portable\setup-offline.bat"
+          if ($LASTEXITCODE -ne 0) { throw "setup-offline.bat failed with exit code $LASTEXITCODE" }
+          cmd /c "hermes-portable\hermes.bat --version"
+          if ($LASTEXITCODE -ne 0) { throw "hermes.bat --version failed with exit code $LASTEXITCODE" }
+          Write-Host "Smoke test PASSED"
+
+      - name: Clean generated state before packaging
+        shell: bash
+        run: |
+          rm -rf hermes-portable/app/venv hermes-portable/data
+          rm -f hermes-portable/app/.env
+          find hermes-portable -type d -name __pycache__ -prune -exec rm -rf {} +
+          mkdir -p hermes-portable/data
+
+      - name: Create zip
+        shell: bash
+        run: |
+          ZIP="hermes-portable-win-x64-v${{ inputs.version }}.zip"
+          7z a -tzip "$ZIP" hermes-portable -mx=7
+          ls -lh "$ZIP"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: hermes-portable-win-x64-*.zip
+          retention-days: 5
+
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ inputs.tag }}
+          path: source
+          fetch-depth: 1
+
+      - name: Setup uv (with Python ${{ inputs.python_version }})
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Assemble portable package
+        shell: bash
+        run: |
+          DIR="hermes-portable"
+          mkdir -p "$DIR/runtime"/{python,node,uv,tools} "$DIR"/{wheels,browsers,scripts,data}
+          cp -r source "$DIR/app"
+
+          # Python runtime (uv-managed standalone build, relocatable)
+          uv python install ${{ inputs.python_version }}
+          PYDIR=$(uv python dir)
+          SRC=$(ls -d "$PYDIR"/cpython-${{ inputs.python_version }}*x86_64*linux*gnu* | head -1)
+          echo "Copying Python from: $SRC"
+          cp -rL "$SRC"/* "$DIR/runtime/python/"
+          "$DIR/runtime/python/bin/python3" --version
+
+          # Node.js runtime
+          NODE_VER=$(node -v | sed 's/v//')
+          curl -sL -o node.tar.gz "https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-linux-x64.tar.gz"
+          tar -xzf node.tar.gz -C "$DIR/runtime/node" --strip-components=1
+          rm node.tar.gz
+          "$DIR/runtime/node/bin/node" --version
+
+          # uv
+          cp "$(which uv)" "$DIR/runtime/uv/uv"
+
+          # ripgrep (static musl build)
+          RG_URL=$(curl -s https://api.github.com/repos/BurntSushi/ripgrep/releases/latest \
+            | grep browser_download_url | grep x86_64-unknown-linux-musl.tar.gz | head -1 | sed 's/.*: "//;s/".*//')
+          echo "ripgrep asset: $RG_URL"
+          [ -n "$RG_URL" ] || { echo "ERROR: ripgrep asset not found"; exit 1; }
+          curl -sL -o rg.tar.gz "$RG_URL"
+          mkdir -p rg-tmp
+          tar -xzf rg.tar.gz -C rg-tmp --strip-components=1
+          cp rg-tmp/rg "$DIR/runtime/tools/"
+          rm -rf rg.tar.gz rg-tmp
+
+          # ffmpeg (johnvansickle static build)
+          curl -sL -o ff.tar.xz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+          mkdir -p ff-tmp && tar -xJf ff.tar.xz -C ff-tmp --strip-components=1
+          cp ff-tmp/ffmpeg ff-tmp/ffprobe "$DIR/runtime/tools/"
+          rm -rf ff.tar.xz ff-tmp
+
+          "$DIR/runtime/uv/uv" --version
+          "$DIR/runtime/tools/rg" --version | head -1
+          "$DIR/runtime/tools/ffmpeg" -version | head -1
+
+      - name: Export locked requirements and download wheels
+        shell: bash
+        working-directory: source
+        run: |
+          uv export --extra all --locked --no-emit-project --no-annotate -o ../requirements-export.txt
+          python -m pip download -r ../requirements-export.txt -d ../hermes-portable/wheels
+          python -m pip download "setuptools==83.0.0" wheel -d ../hermes-portable/wheels
+          echo "Wheel count: $(ls ../hermes-portable/wheels | wc -l)"
+
+      - name: Install Node dependencies into app
+        shell: bash
+        working-directory: hermes-portable/app
+        run: |
+          npm install --workspace ui-tui --workspace web --silent || {
+            echo "::warning::scoped npm install failed, falling back to root install"
+            npm install --silent
+          }
+
+      - name: Bundle Playwright Chromium
+        shell: bash
+        working-directory: hermes-portable/app
+        run: |
+          npx playwright install chromium || echo "::warning::playwright chromium download failed; browser tool will need a system browser"
+          if [ -d "$HOME/.cache/ms-playwright" ]; then
+            cp -r "$HOME/.cache/ms-playwright"/* ../browsers/
+            echo "Bundled browsers:"; ls ../browsers
+          fi
+
+      - name: Generate launcher scripts (Linux)
+        shell: bash
+        run: |
+          cat > hermes-portable/hermes.sh << 'EOF'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          if [ ! -x "$DIR/app/venv/bin/hermes" ]; then
+            echo "[Hermes] Offline install not found. Run ./setup-offline.sh first."
+            exit 1
+          fi
+          export PATH="$DIR/runtime/python/bin:$DIR/runtime/node/bin:$DIR/runtime/uv:$DIR/runtime/tools:$PATH"
+          export PLAYWRIGHT_BROWSERS_PATH="$DIR/browsers"
+          export HERMES_HOME="${HERMES_HOME:-$DIR/data}"
+          exec "$DIR/app/venv/bin/hermes" "$@"
+          EOF
+          chmod +x hermes-portable/hermes.sh
+
+          cat > hermes-portable/setup-offline.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          echo "[Hermes] Offline install starting (1-3 min)..."
+          export PATH="$DIR/runtime/uv:$DIR/runtime/python/bin:$DIR/runtime/node/bin:$DIR/runtime/tools:$PATH"
+          export UV_OFFLINE=1
+          export UV_PYTHON="$DIR/runtime/python/bin/python3"
+          export UV_FIND_LINKS="$DIR/wheels"
+          export UV_CONFIG_FILE="$DIR/offline-uv.toml"
+          export UV_PROJECT_ENVIRONMENT="$DIR/app/venv"
+          export PLAYWRIGHT_BROWSERS_PATH="$DIR/browsers"
+          cd "$DIR/app"
+          uv sync --extra all --locked --offline
+          mkdir -p "$DIR/data"
+          [ -f "$DIR/app/.env" ] || { [ -f "$DIR/app/.env.example" ] && cp "$DIR/app/.env.example" "$DIR/app/.env"; }
+          echo "[Hermes] Verifying..."
+          "$DIR/app/venv/bin/hermes" --version
+          echo "[Hermes] Offline install complete. Run ./hermes.sh to start."
+          EOF
+          chmod +x hermes-portable/setup-offline.sh
+
+          cat > hermes-portable/scripts/gateway.sh << 'EOF'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+          exec "$DIR/hermes.sh" gateway "$@"
+          EOF
+          chmod +x hermes-portable/scripts/gateway.sh
+
+      - name: Write offline config, VERSION, portable README
+        shell: bash
+        run: |
+          cat > hermes-portable/offline-uv.toml << 'EOF'
+          # hermes-portable: force fully-offline resolution.
+          # Wheels come from the bundled wheels/ directory (UV_FIND_LINKS,
+          # absolute path set by setup-offline / launcher scripts).
+          offline = true
+          EOF
+          cat > hermes-portable/VERSION << EOF
+          upstream_tag=${{ inputs.tag }}
+          version=${{ inputs.version }}
+          built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          built_by=hermes-portable CI (https://github.com/hllshiro/hermes-portable)
+          EOF
+          cat > hermes-portable/README-PORTABLE.txt << 'EOF'
+          Hermes Agent Portable (offline build)
+          =====================================
+          Linux: run ./setup-offline.sh first (once), then ./hermes.sh
+          Gateway: ./scripts/gateway.sh
+          Requires: system git (all other runtimes bundled)
+          Model config for offline networks: ./hermes.sh model -> Custom endpoint
+          Data/config lives in ./data/ (HERMES_HOME).
+          See the repository README for details:
+          https://github.com/hllshiro/hermes-portable
+          EOF
+
+      - name: Smoke test offline install (empty uv cache)
+        shell: bash
+        run: |
+          export UV_CACHE_DIR="$RUNNER_TEMP/uv-cache-smoke"
+          mkdir -p "$UV_CACHE_DIR"
+          bash hermes-portable/setup-offline.sh
+          ./hermes-portable/hermes.sh --version
+          echo "Smoke test PASSED"
+
+      - name: Clean generated state before packaging
+        shell: bash
+        run: |
+          rm -rf hermes-portable/app/venv hermes-portable/data
+          rm -f hermes-portable/app/.env
+          find hermes-portable -type d -name __pycache__ -prune -exec rm -rf {} +
+          mkdir -p hermes-portable/data
+
+      - name: Create tarball
+        shell: bash
+        run: |
+          TARBALL="hermes-portable-linux-x64-v${{ inputs.version }}.tar.gz"
+          tar -czf "$TARBALL" hermes-portable
+          ls -lh "$TARBALL"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: hermes-portable-linux-x64-*.tar.gz
+          retention-days: 5
+
+  release:
+    name: Publish release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Fetch upstream release body
+        id: upstream
+        run: |
+          BODY=$(curl -s https://api.github.com/repos/NousResearch/hermes-agent/releases/tags/${{ inputs.tag }} \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('body',''))" 2>/dev/null || echo "")
+          echo "$BODY" > upstream_body.txt
+          echo "Upstream body fetched ($(wc -c < upstream_body.txt) bytes)."
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ inputs.version }}"
+          name: "Hermes Agent Portable v${{ inputs.version }}"
+          body: |
+            > 基于上游 [NousResearch/hermes-agent ${{ inputs.tag }}](https://github.com/NousResearch/hermes-agent/releases/tag/${{ inputs.tag }}) 的**完全离线**便携构建。
+
+            ## 下载 / Downloads
+
+            | 平台 Platform | 文件 File |
+            |----------|------|
+            | Windows x64 | `hermes-portable-win-x64-v${{ inputs.version }}.zip` |
+            | Linux x64 | `hermes-portable-linux-x64-v${{ inputs.version }}.tar.gz` |
+
+            ## 使用 / Usage
+
+            - **Windows**: 解压 → `setup-offline.bat`（首次，离线安装）→ `hermes.bat`
+            - **Linux**: 解压 → `./setup-offline.sh` → `./hermes.sh`（需系统 git）
+            - 离线环境请配置本地模型端点：`hermes model` → Custom endpoint（Ollama / vLLM 等）
+
+            详见 [README](https://github.com/hllshiro/hermes-portable#使用说明)。
+
+            ---
+            ⚠️ 自动化便携构建，不修改上游源码。上游发布说明：https://github.com/NousResearch/hermes-agent/releases/tag/${{ inputs.tag }}
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
