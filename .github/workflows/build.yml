@@ -74,17 +74,16 @@ jobs:
           rm -rf node.zip node-tmp
           hermes-portable/runtime/node/node.exe --version
 
-      - name: Bundle MinGit
+      - name: Bundle Git (from runner image)
         shell: bash
         run: |
-          # Pinned direct release asset (no api.github.com — shared-runner egress is
-          # rate-limited and the asset name embeds the version). Bump on git update.
-          MINGIT_VER=2.55.0.5
-          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o mingit.zip \
-            "https://github.com/git-for-windows/git/releases/download/v${MINGIT_VER}.windows.5/MinGit-${MINGIT_VER}-64-bit.zip"
-          [ "$(head -c 2 mingit.zip)" = "PK" ] || { echo "ERROR: MinGit download is not a valid zip"; exit 1; }
-          unzip -q mingit.zip -d hermes-portable/runtime/git
-          rm mingit.zip
+          # Bundle the Git already preinstalled on the runner (the Git-Bash root).
+          # Avoids the github.com asset CDN, which 404s the MinGit download for
+          # datacenter egress (verified over multiple runs).
+          GITROOT="$(cygpath -w /)"   # Git-Bash '/' == Git install root
+          echo "Bundling Git from: $GITROOT"
+          mkdir -p hermes-portable/runtime/git
+          cp -a "$GITROOT"/. hermes-portable/runtime/git/
           hermes-portable/runtime/git/cmd/git.exe --version
 
       - name: Bundle uv, ripgrep, ffmpeg
