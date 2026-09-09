@@ -49,7 +49,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p hermes-portable/runtime/{python,node,git,uv,tools}
-          mkdir -p hermes-portable/{wheels,browsers,scripts,data}
+          mkdir -p hermes-portable/{uv-cache,browsers,scripts,data}
           cp -r source hermes-portable/app
           echo "Skeleton ready:"; ls hermes-portable
 
@@ -80,7 +80,9 @@ jobs:
           # Pinned direct release asset (no api.github.com — shared-runner egress is
           # rate-limited and the asset name embeds the version). Bump on git update.
           MINGIT_VER=2.55.0.5
-          curl -sL -o mingit.zip "https://github.com/git-for-windows/git/releases/download/v${MINGIT_VER}.windows.5/MinGit-${MINGIT_VER}-64-bit.zip"
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o mingit.zip \
+            "https://github.com/git-for-windows/git/releases/download/v${MINGIT_VER}.windows.5/MinGit-${MINGIT_VER}-64-bit.zip"
+          [ "$(head -c 2 mingit.zip)" = "PK" ] || { echo "ERROR: MinGit download is not a valid zip"; exit 1; }
           unzip -q mingit.zip -d hermes-portable/runtime/git
           rm mingit.zip
           hermes-portable/runtime/git/cmd/git.exe --version
@@ -105,15 +107,19 @@ jobs:
           hermes-portable/runtime/tools/rg.exe --version | head -1
           hermes-portable/runtime/tools/ffmpeg.exe -version | head -1
 
-      - name: Export locked requirements and download wheels
+      - name: Prime uv cache (full locked install)
         shell: bash
         working-directory: source
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/build-uvcache
         run: |
-          uv export --extra all --locked --no-emit-project --no-annotate -o ../requirements-export.txt
-          python -m pip download -r ../requirements-export.txt -d ../hermes-portable/wheels
-          # Root project PEP 517 build backend (needed to build hermes-agent itself offline)
-          python -m pip download "setuptools==83.0.0" wheel -d ../hermes-portable/wheels
-          echo "Wheel count: $(ls ../hermes-portable/wheels | wc -l)"
+          # Online locked install populates a uv cache we ship wholesale, so the
+          # target machine can run `uv sync --offline` with no network and no pip.
+          uv sync --extra all --locked
+          uv cache prune
+          mkdir -p ../hermes-portable/uv-cache
+          cp -a "$UV_CACHE_DIR"/. ../hermes-portable/uv-cache/
+          echo "uv-cache size: $(du -sh ../hermes-portable/uv-cache | cut -f1)"
 
       - name: Install Node dependencies into app
         shell: bash
@@ -159,8 +165,7 @@ jobs:
           set "PATH=%ROOT%runtime\uv;%ROOT%runtime\python;%ROOT%runtime\node;%ROOT%runtime\git\cmd;%ROOT%runtime\tools;%PATH%"
           set "UV_OFFLINE=1"
           set "UV_PYTHON=%ROOT%runtime\python\python.exe"
-          set "UV_FIND_LINKS=%ROOT%wheels"
-          set "UV_CONFIG_FILE=%ROOT%offline-uv.toml"
+          set "UV_CACHE_DIR=%ROOT%uv-cache"
           set "UV_PROJECT_ENVIRONMENT=%ROOT%app\venv"
           set "PLAYWRIGHT_BROWSERS_PATH=%ROOT%browsers"
           cd /d "%ROOT%app"
@@ -186,15 +191,9 @@ jobs:
           call "%SCRIPT_DIR%..\hermes.bat" gateway %*
           "@ | Out-File "hermes-portable\scripts\gateway.bat" -Encoding ASCII
 
-      - name: Write offline config, VERSION, portable README
+      - name: Write VERSION and portable README
         shell: bash
         run: |
-          cat > hermes-portable/offline-uv.toml << 'EOF'
-          # hermes-portable: force fully-offline resolution.
-          # Wheels come from the bundled wheels/ directory (UV_FIND_LINKS,
-          # absolute path set by setup-offline / launcher scripts).
-          offline = true
-          EOF
           cat > hermes-portable/VERSION << EOF
           upstream_tag=${{ inputs.tag }}
           version=${{ inputs.version }}
@@ -212,11 +211,11 @@ jobs:
           https://github.com/hllshiro/hermes-portable
           EOF
 
-      - name: Smoke test offline install (empty uv cache)
+      - name: Smoke test offline install
         shell: pwsh
         run: |
-          $env:UV_CACHE_DIR = Join-Path $env:RUNNER_TEMP "uv-cache-smoke"
-          New-Item -ItemType Directory -Force -Path $env:UV_CACHE_DIR | Out-Null
+          # setup-offline.bat forces UV_OFFLINE=1 and points UV_CACHE_DIR at the
+          # shipped package cache — this proves the packaged build installs offline.
           cmd /c "hermes-portable\setup-offline.bat"
           if ($LASTEXITCODE -ne 0) { throw "setup-offline.bat failed with exit code $LASTEXITCODE" }
           cmd /c "hermes-portable\hermes.bat --version"
@@ -271,7 +270,7 @@ jobs:
         shell: bash
         run: |
           DIR="hermes-portable"
-          mkdir -p "$DIR/runtime"/{python,node,uv,tools} "$DIR"/{wheels,browsers,scripts,data}
+          mkdir -p "$DIR/runtime"/{python,node,uv,tools} "$DIR"/{uv-cache,browsers,scripts,data}
           cp -r source "$DIR/app"
 
           # Python runtime (uv-managed standalone build, relocatable).
@@ -314,14 +313,19 @@ jobs:
           "$DIR/runtime/tools/rg" --version | head -1
           "$DIR/runtime/tools/ffmpeg" -version | head -1
 
-      - name: Export locked requirements and download wheels
+      - name: Prime uv cache (full locked install)
         shell: bash
         working-directory: source
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/build-uvcache
         run: |
-          uv export --extra all --locked --no-emit-project --no-annotate -o ../requirements-export.txt
-          python -m pip download -r ../requirements-export.txt -d ../hermes-portable/wheels
-          python -m pip download "setuptools==83.0.0" wheel -d ../hermes-portable/wheels
-          echo "Wheel count: $(ls ../hermes-portable/wheels | wc -l)"
+          # Online locked install populates a uv cache we ship wholesale, so the
+          # target machine can run `uv sync --offline` with no network and no pip.
+          uv sync --extra all --locked
+          uv cache prune
+          mkdir -p ../hermes-portable/uv-cache
+          cp -a "$UV_CACHE_DIR"/. ../hermes-portable/uv-cache/
+          echo "uv-cache size: $(du -sh ../hermes-portable/uv-cache | cut -f1)"
 
       - name: Install Node dependencies into app
         shell: bash
@@ -367,8 +371,7 @@ jobs:
           export PATH="$DIR/runtime/uv:$DIR/runtime/python/bin:$DIR/runtime/node/bin:$DIR/runtime/tools:$PATH"
           export UV_OFFLINE=1
           export UV_PYTHON="$DIR/runtime/python/bin/python3"
-          export UV_FIND_LINKS="$DIR/wheels"
-          export UV_CONFIG_FILE="$DIR/offline-uv.toml"
+          export UV_CACHE_DIR="$DIR/uv-cache"
           export UV_PROJECT_ENVIRONMENT="$DIR/app/venv"
           export PLAYWRIGHT_BROWSERS_PATH="$DIR/browsers"
           cd "$DIR/app"
@@ -388,15 +391,9 @@ jobs:
           EOF
           chmod +x hermes-portable/scripts/gateway.sh
 
-      - name: Write offline config, VERSION, portable README
+      - name: Write VERSION and portable README
         shell: bash
         run: |
-          cat > hermes-portable/offline-uv.toml << 'EOF'
-          # hermes-portable: force fully-offline resolution.
-          # Wheels come from the bundled wheels/ directory (UV_FIND_LINKS,
-          # absolute path set by setup-offline / launcher scripts).
-          offline = true
-          EOF
           cat > hermes-portable/VERSION << EOF
           upstream_tag=${{ inputs.tag }}
           version=${{ inputs.version }}
@@ -415,11 +412,11 @@ jobs:
           https://github.com/hllshiro/hermes-portable
           EOF
 
-      - name: Smoke test offline install (empty uv cache)
+      - name: Smoke test offline install
         shell: bash
         run: |
-          export UV_CACHE_DIR="$RUNNER_TEMP/uv-cache-smoke"
-          mkdir -p "$UV_CACHE_DIR"
+          # setup-offline.sh forces UV_OFFLINE=1 and points UV_CACHE_DIR at the
+          # shipped package cache — this proves the packaged build installs offline.
           bash hermes-portable/setup-offline.sh
           ./hermes-portable/hermes.sh --version
           echo "Smoke test PASSED"
