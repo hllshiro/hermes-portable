@@ -77,11 +77,10 @@ jobs:
       - name: Bundle MinGit
         shell: bash
         run: |
-          ASSET=$(curl -s https://api.github.com/repos/git-for-windows/git/releases/latest \
-            | grep browser_download_url | grep -i mingit | grep 64-bit | grep -v busybox | head -1 | sed 's/.*: "//;s/".*//')
-          echo "MinGit asset: $ASSET"
-          [ -n "$ASSET" ] || { echo "ERROR: MinGit asset not found"; exit 1; }
-          curl -sL -o mingit.zip "$ASSET"
+          # Pinned direct release asset (no api.github.com — shared-runner egress is
+          # rate-limited and the asset name embeds the version). Bump on git update.
+          MINGIT_VER=2.55.0.5
+          curl -sL -o mingit.zip "https://github.com/git-for-windows/git/releases/download/v${MINGIT_VER}.windows.5/MinGit-${MINGIT_VER}-64-bit.zip"
           unzip -q mingit.zip -d hermes-portable/runtime/git
           rm mingit.zip
           hermes-portable/runtime/git/cmd/git.exe --version
@@ -90,10 +89,9 @@ jobs:
         shell: bash
         run: |
           cp "$(which uv)" hermes-portable/runtime/uv/uv.exe
-          RG_URL=$(curl -s https://api.github.com/repos/BurntSushi/ripgrep/releases/latest \
-            | grep browser_download_url | grep x86_64-pc-windows-msvc.zip | head -1 | sed 's/.*: "//;s/".*//')
+          # Pinned ripgrep 15.2.0 release (direct asset, no api.github.com).
+          RG_URL="https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip"
           echo "ripgrep asset: $RG_URL"
-          [ -n "$RG_URL" ] || { echo "ERROR: ripgrep asset not found"; exit 1; }
           curl -sL -o rg.zip "$RG_URL"
           unzip -q rg.zip -d rg-tmp
           find rg-tmp -name rg.exe -exec cp {} hermes-portable/runtime/tools/ \;
@@ -276,12 +274,15 @@ jobs:
           mkdir -p "$DIR/runtime"/{python,node,uv,tools} "$DIR"/{wheels,browsers,scripts,data}
           cp -r source "$DIR/app"
 
-          # Python runtime (uv-managed standalone build, relocatable)
+          # Python runtime (uv-managed standalone build, relocatable).
+          # Dir names vary by platform/naming scheme, so resolve via `uv python
+          # find` and take the interpreter's install root, not a fragile glob.
           uv python install ${{ inputs.python_version }}
-          PYDIR=$(uv python dir)
-          SRC=$(ls -d "$PYDIR"/cpython-${{ inputs.python_version }}*x86_64*linux*gnu* | head -1)
-          echo "Copying Python from: $SRC"
-          cp -rL "$SRC"/* "$DIR/runtime/python/"
+          PYEXE=$(uv python find ${{ inputs.python_version }})
+          echo "Interpreter: $PYEXE"
+          PYROOT=$(dirname "$(dirname "$PYEXE")")   # <root>/bin/python3 -> <root>
+          echo "Copying Python from: $PYROOT"
+          cp -rL "$PYROOT"/. "$DIR/runtime/python/"
           "$DIR/runtime/python/bin/python3" --version
 
           # Node.js runtime
@@ -294,11 +295,9 @@ jobs:
           # uv
           cp "$(which uv)" "$DIR/runtime/uv/uv"
 
-          # ripgrep (static musl build)
-          RG_URL=$(curl -s https://api.github.com/repos/BurntSushi/ripgrep/releases/latest \
-            | grep browser_download_url | grep x86_64-unknown-linux-musl.tar.gz | head -1 | sed 's/.*: "//;s/".*//')
+          # ripgrep (static musl build, pinned 15.2.0 direct asset)
+          RG_URL="https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz"
           echo "ripgrep asset: $RG_URL"
-          [ -n "$RG_URL" ] || { echo "ERROR: ripgrep asset not found"; exit 1; }
           curl -sL -o rg.tar.gz "$RG_URL"
           mkdir -p rg-tmp
           tar -xzf rg.tar.gz -C rg-tmp --strip-components=1
